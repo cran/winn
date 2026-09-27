@@ -1,0 +1,272 @@
+---
+title: "WiNN Tutorial: A Reproducible LC-MS Example"
+output: rmarkdown::html_vignette
+vignette: >
+  %\VignetteIndexEntry{WiNN Tutorial: A Reproducible LC-MS Example}
+  %\VignetteEngine{knitr::rmarkdown}
+  %\VignetteEncoding{UTF-8}
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  collapse = TRUE,
+  comment = "#>",
+  fig.width = 7,
+  fig.height = 4,
+  message = FALSE,
+  warning = FALSE
+)
+
+library(winn)
+```
+
+This vignette runs a single, fully reproducible WiNN workflow on simulated LC-MS
+data. Every object is created inside the document, so the example can be rerun
+unchanged during `R CMD check`. To keep the vignette lightweight, it uses only
+base R plus `winn`, avoids slow parameter-grid searches, and focuses on a
+single before/after comparison.
+
+## 1. Simulate a small LC-MS dataset
+
+We simulate 30 metabolites measured across 96 injections. Every eighth
+injection is a pooled QC sample, so QC values should be close after technical
+correction. The observed matrix includes dilution, drift, batch shifts, and
+random noise layered on top of a known ground-truth signal.
+
+```{r simulate}
+set.seed(42)
+
+n_met <- 30L
+n_samples <- 96L
+n_batches <- 4L
+
+batch <- rep(seq_len(n_batches), each = n_samples / n_batches)
+run_order <- seq_len(n_samples)
+qc_idx <- seq(4, n_samples, by = 8)
+study_idx <- setdiff(seq_len(n_samples), qc_idx)
+
+base_mean <- rnorm(n_met, mean = 7.8, sd = 0.35)
+true_log <- base_mean + matrix(rnorm(n_met * n_samples, sd = 0.08), nrow = n_met)
+
+signal_metabolites <- 1:6
+study_signal <- as.numeric(scale(sin(study_idx / 9) + rnorm(length(study_idx), sd = 0.2)))
+true_log[signal_metabolites, study_idx] <- true_log[signal_metabolites, study_idx] +
+  0.30 * matrix(
+    study_signal,
+    nrow = length(signal_metabolites),
+    ncol = length(study_idx),
+    byrow = TRUE
+  )
+
+covariate_metabolites <- 7:10
+continuous_covariate <- numeric(n_samples)
+continuous_covariate[study_idx] <- as.numeric(scale(runif(length(study_idx))))
+true_log[covariate_metabolites, ] <- true_log[covariate_metabolites, ] +
+  0.20 * matrix(
+    continuous_covariate,
+    nrow = length(covariate_metabolites),
+    ncol = n_samples,
+    byrow = TRUE
+  )
+
+pooled_qc <- rowMeans(true_log[, study_idx, drop = FALSE])
+true_log[, qc_idx] <- pooled_qc
+
+make_batch_drift <- function(n, amplitude) {
+  x <- seq(0, 1, length.out = n)
+  amplitude * (0.8 * x - 0.6 * x^2 + 0.15 * sin(2 * pi * x))
+}
+
+batch_drift <- numeric(n_samples)
+drift_amplitude <- c(0.22, 0.14, 0.18, 0.10)
+for (b in seq_len(n_batches)) {
+  idx <- which(batch == b)
+  batch_drift[idx] <- make_batch_drift(length(idx), drift_amplitude[b])
+}
+
+metabolite_drift_scale <- matrix(
+  0.05 + 0.25 * runif(n_met),
+  nrow = n_met,
+  ncol = n_samples
+)
+drift_log <- matrix(batch_drift, nrow = n_met, ncol = n_samples, byrow = TRUE) *
+  metabolite_drift_scale
+
+batch_shift <- matrix(0, nrow = n_met, ncol = n_samples)
+batch_centers <- c(-0.18, 0.05, 0.12, -0.08)
+for (b in seq_len(n_batches)) {
+  idx <- which(batch == b)
+  batch_shift[, idx] <- rnorm(n_met, mean = batch_centers[b], sd = 0.04)
+}
+
+dilution_factor <- exp(rnorm(n_samples, sd = 0.06))
+noise_log <- matrix(rnorm(n_met * n_samples, sd = 0.08), nrow = n_met)
+
+observed_log <- true_log +
+  matrix(log(dilution_factor), nrow = n_met, ncol = n_samples, byrow = TRUE) +
+  drift_log +
+  batch_shift +
+  noise_log
+
+true_intensity <- pmax(expm1(true_log), 0)
+observed_intensity <- pmax(expm1(observed_log), 0)
+```
+
+## 2. Run WiNN
+
+For a vignette, fixed settings are the most practical choice because they are
+fast and deterministic. The auto-tuning mode is still available for full
+analyses when you want QC-guided parameter selection.
+
+```{r run-winn}
+corrected_intensity <- winn(
+  observed_intensity,
+  batch = batch,
+  run_order = run_order,
+  control_samples = qc_idx,
+  parameters = "fixed",
+  fdr_threshold = 0.05,
+  median_adjustment = "shrink",
+  remove_batch_effects = "anova",
+  lag = NULL,
+  scale_by_batch = FALSE
+)
+```
+
+## 3. Summarize agreement with the known truth
+
+We use three metrics:
+
+- Mean per-metabolite Pearson correlation on the `log1p` scale
+- Mean per-metabolite ICC(A,1) on the `log1p` scale
+- Mean QC coefficient of variation (QC-CV) on the intensity scale
+
+Higher Pearson and ICC indicate stronger agreement with the ground-truth
+profiles. Lower QC-CV indicates tighter pooled controls.
+
+```{r metrics}
+mean_qc_cv <- function(x, qc_samples) {
+  qc_values <- x[, qc_samples, drop = FALSE]
+  qc_cvs <- apply(qc_values, 1, function(v) {
+    mu <- mean(v, na.rm = TRUE)
+    if (!is.finite(mu) || abs(mu) < .Machine$double.eps) {
+      return(NA_real_)
+    }
+    sd(v, na.rm = TRUE) / abs(mu)
+  })
+  mean(qc_cvs, na.rm = TRUE)
+}
+
+icc_a1 <- function(reference, candidate) {
+  keep <- is.finite(reference) & is.finite(candidate)
+  reference <- reference[keep]
+  candidate <- candidate[keep]
+  n <- length(reference)
+  k <- 2L
+
+  if (n < 2L) {
+    return(NA_real_)
+  }
+
+  ratings <- cbind(reference, candidate)
+  grand_mean <- mean(ratings)
+  row_means <- rowMeans(ratings)
+  col_means <- colMeans(ratings)
+
+  ss_rows <- k * sum((row_means - grand_mean)^2)
+  ss_cols <- n * sum((col_means - grand_mean)^2)
+  ss_total <- sum((ratings - grand_mean)^2)
+  ss_error <- ss_total - ss_rows - ss_cols
+
+  ms_rows <- ss_rows / (n - 1)
+  ms_cols <- ss_cols / (k - 1)
+  ms_error <- ss_error / ((n - 1) * (k - 1))
+
+  denom <- ms_rows + (k - 1) * ms_error + (k * (ms_cols - ms_error) / n)
+  if (!is.finite(denom) || denom <= 0) {
+    return(NA_real_)
+  }
+
+  (ms_rows - ms_error) / denom
+}
+
+calc_metrics <- function(candidate, truth, qc_samples) {
+  candidate_log <- log1p(candidate)
+  truth_log <- log1p(truth)
+
+  pearson_vals <- vapply(seq_len(nrow(candidate)), function(i) {
+    cor(candidate_log[i, ], truth_log[i, ], use = "pairwise.complete.obs")
+  }, numeric(1))
+
+  icc_vals <- vapply(seq_len(nrow(candidate)), function(i) {
+    icc_a1(truth_log[i, ], candidate_log[i, ])
+  }, numeric(1))
+
+  data.frame(
+    mean_pearson = mean(pearson_vals, na.rm = TRUE),
+    mean_icc = mean(icc_vals, na.rm = TRUE),
+    mean_qc_cv = mean_qc_cv(candidate, qc_samples)
+  )
+}
+
+summary_metrics <- rbind(
+  raw = calc_metrics(observed_intensity, true_intensity, qc_idx),
+  winn = calc_metrics(corrected_intensity, true_intensity, qc_idx)
+)
+
+knitr::kable(
+  round(summary_metrics, 4),
+  caption = "Before/after metrics for the simulated dataset."
+)
+```
+
+On this simulated dataset, WiNN should increase agreement with the known truth
+while reducing pooled-QC variability.
+
+## 4. Visualize a few metabolites
+
+The plot below shows four representative metabolites. Grey traces are the
+observed measurements, dashed black traces are the true underlying signal, and
+blue traces are the WiNN-corrected values. Orange points mark pooled QC
+injections.
+
+```{r plot, fig.height=6}
+met_ids <- c(1, 6, 9, 14)
+panel_breaks <- (n_samples / n_batches) * seq_len(n_batches - 1) + 0.5
+
+op <- par(mfrow = c(2, 2), mar = c(3.5, 3.5, 2.5, 1))
+
+for (met in met_ids) {
+  y_raw <- log1p(observed_intensity[met, ])
+  y_true <- log1p(true_intensity[met, ])
+  y_winn <- log1p(corrected_intensity[met, ])
+  y_lim <- range(c(y_raw, y_true, y_winn), finite = TRUE)
+
+  plot(
+    run_order,
+    y_raw,
+    type = "l",
+    col = "grey55",
+    lwd = 1,
+    ylim = y_lim,
+    xlab = "Run order",
+    ylab = "log1p(Intensity)",
+    main = paste("Metabolite", met)
+  )
+  abline(v = panel_breaks, lty = 3, col = "grey80")
+  lines(run_order, y_true, col = "black", lty = 2, lwd = 1.2)
+  lines(run_order, y_winn, col = "#1b6ca8", lwd = 1.4)
+  points(qc_idx, y_winn[qc_idx], pch = 16, cex = 0.6, col = "#d95f02")
+}
+
+par(op)
+```
+
+## 5. Takeaways
+
+- The vignette is self-contained: it generates its own data and reruns without
+  external files or internet access.
+- A fixed-parameter WiNN run is fast enough for documentation while still
+  showing the full correction workflow.
+- Pearson, ICC, and QC-CV provide complementary checks: signal recovery,
+  agreement, and QC tightness.
